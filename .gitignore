@@ -1,0 +1,17 @@
+# Ignore specific folder
+product_images/
+temp_videos/
+__pycache__/
+
+# Ignore specific files
+products_300.json
+test2.py
+t1.py
+backend.zip
+frontend.zip
+
+# Ignore all node_modules folders recursively
+**/node_modules/
+
+# Ignore all .pt files (e.g., PyTorch model files)
+**/*.pt
