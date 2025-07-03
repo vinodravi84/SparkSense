@@ -1,6 +1,4 @@
-# Save as main.py or integrate with your existing FastAPI/OpenCV pipeline
-# Requires: ultralytics (YOLOv8), deep_sort_realtime, OpenCV
-
+# ─── IMPORTS ───
 import os
 import cv2
 import time
@@ -9,13 +7,13 @@ from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from collections import deque, defaultdict
 
-# ─── CONFIG ───
+# ─── CONFIGURATION ───
 YOLO_MODEL = "yolov8m.pt"
-DETECT_SIZE = 1280
+DETECT_SIZE = 640
 CONF_THRESHOLD = 0.4
 IOU_THRESHOLD = 0.45
 FPS = 30.0
-AVG_CAR_WIDTH_M = 2.0  # Calibrated for better real-world scaling
+AVG_CAR_WIDTH_M = 2.0
 CALIBRATE_SAMPLES = 75
 SMOOTH_WINDOW = 7
 SPEED_LIMIT = 50.0
@@ -24,6 +22,7 @@ BOX_THICKNESS = 3
 TEXT_THICKNESS = 2
 MIN_PERSISTENCE = 2
 MIN_BOX_AREA = 40 * 40
+TRAIL_LENGTH = 30
 
 # ─── MODELS ───
 model = YOLO(YOLO_MODEL)
@@ -44,6 +43,7 @@ def iou(boxA, boxB):
 
 def estimate_homography(car_boxes):
     image_pts, world_pts = [], []
+    car_index = 0
     for box in car_boxes:
         x1, y1, x2, y2 = box
         w = x2 - x1
@@ -51,7 +51,8 @@ def estimate_homography(car_boxes):
             continue
         y = y2
         image_pts += [[x1, y], [x2, y]]
-        world_pts += [[0, 0], [AVG_CAR_WIDTH_M, 0]]
+        world_pts += [[0, car_index * 2.5], [AVG_CAR_WIDTH_M, car_index * 2.5]]
+        car_index += 1
     if len(image_pts) >= 4:
         H, _ = cv2.findHomography(np.array(image_pts, dtype=np.float32),
                                   np.array(world_pts, dtype=np.float32), 0)
@@ -81,6 +82,7 @@ def calibrate_ppm(video_path):
     cap.release()
     return np.median(widths) / AVG_CAR_WIDTH_M if widths else 300.0
 
+# ─── MAIN FUNCTION ───
 def process_frame_stream(video_path):
     start_time = time.time()
     ppm = calibrate_ppm(video_path)
@@ -88,15 +90,24 @@ def process_frame_stream(video_path):
 
     cap = cv2.VideoCapture(video_path)
     W, H_vid = int(cap.get(3)), int(cap.get(4))
+    line_y = int(H_vid * 0.5)
+
     base, _ = os.path.splitext(video_path)
     writer = cv2.VideoWriter(f"{base}_processed.mp4", cv2.VideoWriter_fourcc(*'mp4v'), FPS, (W, H_vid))
 
     world_pos = {}
+    world_pos_img = {}
     max_speeds = {}
     box_history = defaultdict(lambda: deque(maxlen=SMOOTH_WINDOW))
     height_history = defaultdict(lambda: deque(maxlen=5))
+    trail_history = defaultdict(lambda: deque(maxlen=TRAIL_LENGTH))
     persistence = defaultdict(int)
-
+    car_boxes_for_H_all = []
+    speed_zone_active_ids = set()
+    crossed_status = {}
+    in_count = 0
+    out_count = 0
+    counted_ids = set()
     frame_count = 0
     allowed = {"car", "truck", "bus", "motorcycle", "bicycle"}
 
@@ -104,14 +115,11 @@ def process_frame_stream(video_path):
         ret, frame = cap.read()
         if not ret:
             break
-
         frame_count += 1
         inp = cv2.resize(frame, (DETECT_SIZE, DETECT_SIZE))
         res = model.predict(inp, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD, verbose=False)[0]
-
         x_scale, y_scale = W / DETECT_SIZE, H_vid / DETECT_SIZE
         dets_raw = []
-        car_boxes_for_H = []
 
         for box, conf, cls in zip(res.boxes.xyxy, res.boxes.conf, res.boxes.cls):
             if conf < CONF_THRESHOLD:
@@ -128,11 +136,11 @@ def process_frame_stream(video_path):
                 continue
             dets_raw.append(([bx, by, bw, bh], float(conf), label))
             if label == "car":
-                car_boxes_for_H.append([bx, by, bx + bw, by + bh])
+                car_boxes_for_H_all.append([bx, by, bx + bw, by + bh])
 
-        if frame_count == 10:
-            H = estimate_homography(car_boxes_for_H)
-            print("[CALIBRATION] Homography matrix estimated." if H is not None else "[CALIBRATION] Homography failed. Falling back to PPM.")
+        if frame_count % 10 == 0 and H is None and len(car_boxes_for_H_all) >= 4:
+            H = estimate_homography(car_boxes_for_H_all)
+            print(f"[CALIBRATION] Homography {'estimated' if H is not None else 'failed'} at frame {frame_count}")
 
         dets = []
         for i, (boxA, confA, _) in enumerate(dets_raw):
@@ -144,7 +152,9 @@ def process_frame_stream(video_path):
             if keep:
                 dets.append(dets_raw[i])
 
-        print(f"\n[FRAME {frame_count}] Detected {len(dets)} vehicles.")
+        cv2.circle(frame, (int(W * 0.05), line_y), 6, (0, 255, 255), -1)
+        cv2.circle(frame, (int(W * 0.95), line_y), 6, (0, 255, 255), -1)
+
         tracks = tracker.update_tracks(dets, frame=frame)
         current_ids = set()
 
@@ -157,54 +167,83 @@ def process_frame_stream(video_path):
             current_ids.add(tid)
             persistence[tid] += 1
             box_history[tid].append((l, t, r, b))
+            trail_history[tid].append((cx, cy))
             height = b - t
             height_history[tid].append(height)
+            sl, st, sr, sb = np.mean(box_history[tid], axis=0).astype(int)
+            col = get_color(tid)
+            cv2.rectangle(frame, (sl, st), (sr, sb), col, BOX_THICKNESS)
 
-            # World coordinates
-            if H is not None:
-                wpos = map_to_world(H, (cx, cy))
-            else:
-                wpos = (cx / ppm, cy / ppm)
-
-            # Smooth world pos
-            if tid in world_pos:
-                old = np.array(world_pos[tid])
-                new = np.array(wpos)
-                dist = np.linalg.norm(new - old)
-
-                if dist < 0.01 and len(height_history[tid]) >= 3:
-                    dh = np.abs(np.diff(list(height_history[tid])))
-                    avg_dh = np.mean(dh)
-                    avg_h = np.mean(height_history[tid])
-                    fallback_speed = (avg_dh / avg_h) * 80 * FPS if avg_h > 0 else 0  # ← Reduced multiplier
-                    speed = round(np.clip(fallback_speed, 10, 55), 1)
-                    print(f"[DEBUG][F{frame_count}] ID{tid} fallback: ΔH={avg_dh:.1f}, H={avg_h:.1f}, Speed={speed:.1f} km/h")
+            # IN/OUT count logic
+            if tid not in crossed_status:
+                crossed_status[tid] = cy
+            delta_y = cy - crossed_status[tid]
+            crossed_status[tid] = cy
+            if abs(delta_y) > 5 and tid not in counted_ids:
+                counted_ids.add(tid)
+                if delta_y > 0:
+                    in_count += 1
+                    print(f"[FRAME {frame_count}] ID{tid} → IN (ΔY={delta_y:.1f})")
                 else:
-                    dx, dy = new[0] - old[0], new[1] - old[1]
-                    dist = np.hypot(dx, dy)
-                    speed = round((dist / (1.0 / FPS)) * 3.6, 1)
-                    print(f"[DEBUG][F{frame_count}] ID{tid} Δm={dist:.2f}, Speed={speed:.1f} km/h")
+                    out_count += 1
+                    print(f"[FRAME {frame_count}] ID{tid} → OUT (ΔY={delta_y:.1f})")
 
-                prev = max_speeds.get(tid, 0)
-                if speed - prev > 20:
-                    speed = prev + 5  # Gradual step
-                max_speeds[tid] = max(speed, prev)
-            else:
-                max_speeds[tid] = 0.0
+            # Speed zone logic
+            if cy >= line_y:
+                speed_zone_active_ids.add(tid)
+            if tid in speed_zone_active_ids:
+                wpos = map_to_world(H, (cx, cy)) if H is not None else (cx / ppm, cy / ppm)
+                if tid in world_pos:
+                    old_img = np.array(world_pos_img.get(tid, (cx, cy)))
+                    new_img = np.array([cx, cy])
+                    image_dist = np.linalg.norm(new_img - old_img)
+                    world_pos_img[tid] = (cx, cy)
+                    old = np.array(world_pos[tid])
+                    new = np.array(wpos)
+                    dist = np.linalg.norm(new - old)
+                    if image_dist < 2:
+                        dist = 0.0
+                    if dist < 0.01 and len(height_history[tid]) >= 3:
+                        dh = np.abs(np.diff(list(height_history[tid])))
+                        avg_dh = np.mean(dh)
+                        avg_h = np.mean(height_history[tid])
+                        speed = round(np.clip((avg_dh / avg_h) * 80 * FPS, 0, 55), 1) if avg_h > 0 else 0.0
+                        print(f"[DEBUG][F{frame_count}] ID{tid} fallback: ΔH={avg_dh:.1f}, H={avg_h:.1f}, Speed={speed:.1f} km/h")
+                    else:
+                        speed = round((dist / (1.0 / FPS)) * 3.6, 1)
+                        if speed > 90:
+                            print(f"[WARN][F{frame_count}] ID{tid} speed too high: {speed} km/h, skipped.")
+                            speed = 0.0
+                        else:
+                            print(f"[DEBUG][F{frame_count}] ID{tid} Δm={dist:.2f}, Speed={speed:.1f} km/h")
+                    prev = max_speeds.get(tid, 0)
+                    if speed - prev > 20:
+                        speed = prev + 5
+                    max_speeds[tid] = max(speed, prev)
+                else:
+                    max_speeds[tid] = 0.0
+                    world_pos_img[tid] = (cx, cy)
+                world_pos[tid] = wpos
+                speed = max_speeds[tid]
+                if persistence[tid] >= MIN_PERSISTENCE:
+                    color = (0, 0, 255) if speed > SPEED_LIMIT and (frame_count // BLINK_INTERVAL) % 2 == 0 else col
+                    cv2.putText(frame, f"ID{tid} {speed:.1f} km/h", (sl, st - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, TEXT_THICKNESS)
 
-            world_pos[tid] = wpos
-            speed = max_speeds[tid]
-
-            # Draw box
-            if persistence[tid] >= MIN_PERSISTENCE:
-                col = (0, 0, 255) if speed > SPEED_LIMIT and (frame_count // BLINK_INTERVAL) % 2 == 0 else get_color(tid)
-                sl, st, sr, sb = np.mean(box_history[tid], axis=0).astype(int)
-                cv2.rectangle(frame, (sl, st), (sr, sb), col, BOX_THICKNESS)
-                cv2.putText(frame, f"ID{tid} {speed:.1f} km/h", (sl, st - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, TEXT_THICKNESS)
+            # Draw arrow trail
+            for i in range(1, len(trail_history[tid])):
+                pt1 = trail_history[tid][i - 1]
+                pt2 = trail_history[tid][i]
+                alpha = int(255 * (i / len(trail_history[tid])))
+                color = tuple(int(c * (i / len(trail_history[tid]))) for c in get_color(tid))
+                cv2.arrowedLine(frame, pt1, pt2, color, 2, tipLength=0.3)
 
         for tid in list(persistence):
             if tid not in current_ids:
                 persistence[tid] = 0
+
+        cv2.putText(frame, f"IN: {in_count}  OUT: {out_count}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
 
         writer.write(frame)
         _, jpg = cv2.imencode('.jpg', frame)
